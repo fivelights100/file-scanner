@@ -1,14 +1,15 @@
 {
   "name": "freel-file-scanner",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
-  "type": "module",
   "scripts": {
-    "start": "tsx index.ts"
+    "dev": "tsx index.ts",
+    "build": "ncc build index.ts -o dist",
+    "package": "pkg dist/index.js --targets node18-win-x64 --output freel-scanner.exe"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
+    "@vercel/ncc": "^0.38.1",
+    "pkg": "^5.8.1",
     "tsx": "^4.0.0",
     "typescript": "^5.0.0"
   }

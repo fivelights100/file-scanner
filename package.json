@@ -8,9 +8,13 @@
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
+    "@types/ws": "^8.18.1",
     "@vercel/ncc": "^0.38.1",
     "pkg": "^5.8.1",
     "tsx": "^4.0.0",
     "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "ws": "^8.20.0"
   }
 }

@@ -24,19 +24,38 @@ const getAvailableDrives = async (): Promise<string[]> => {
 // ==========================================
 // [1] 스캐너 유틸리티 (캐싱 폴더 탐색용)
 // ==========================================
-// 💡 수정: dir(폴더) 배열 추가
-interface ScanResults { exe: string[]; bat: string[]; dir: string[]; lnk: string[]; url: string[]; }
+interface ScanResults { 
+    dir: string[]; 
+    executable: string[]; 
+    readable: string[]; 
+}
+
 const ensureDirectoryExists = (dirPath: string) => { if (!fs.existsSync(dirPath)) fs.mkdirSync(dirPath, { recursive: true }); };
 
 const categorizeFile = (filePath: string, results: ScanResults) => {
     const ext = path.extname(filePath).toLowerCase();
-    if (ext === '.exe') results.exe.push(filePath);
-    else if (ext === '.bat') results.bat.push(filePath);
-    else if (ext === '.lnk') results.lnk.push(filePath);
-    else if (ext === '.url') results.url.push(filePath);
+    
+    // 실행 파일 그룹 (앱, 바로가기, 배치파일 등)
+    const execExts = ['.exe', '.bat', '.cmd', '.lnk', '.url'];
+    // 읽기 가능한 파일 그룹 (문서, 코드, 설정파일 등)
+    const readExts = ['.txt', '.md', '.json', '.csv', '.ts', '.tsx', '.js', '.jsx', '.html', '.css', '.env', '.log', '.xml', '.yml', '.yaml', '.ini', '.conf'];
+
+    if (execExts.includes(ext)) {
+        results.executable.push(filePath);
+    } else if (readExts.includes(ext)) {
+        results.readable.push(filePath);
+    } 
+    // 그 외의 거대한 바이너리 파일(.mp4, .dll, .iso 등)은 스캔은 하되 메모리 최적화를 위해 캐싱하지 않습니다.
 };
 
-const scanDirectory = (currentDir: string, currentDepth = 1, maxDepth = 5, results: ScanResults = { exe: [], bat: [], dir: [], lnk: [], url: [] }, blacklistNames: string[] = [], blacklistPaths: string[] = []) => {
+const scanDirectory = (
+    currentDir: string, 
+    currentDepth = 1, 
+    maxDepth = 10, // 💡 기본값을 5에서 10으로 변경
+    results: ScanResults = { dir: [], executable: [], readable: [] }, // 💡 3가지 통합 구조로 변경
+    blacklistNames: string[] = [], 
+    blacklistPaths: string[] = []
+) => {
     if (currentDepth > maxDepth) return results;
 
     // 💡 1. 경로(Path) 기반 검사: 현재 경로가 블랙리스트 경로로 시작하면 통째로 스킵
@@ -68,17 +87,66 @@ const scanDirectory = (currentDir: string, currentDepth = 1, maxDepth = 5, resul
 const PORT = 8080;
 const wss = new WebSocketServer({ port: PORT });
 const outputDir = path.join(os.homedir(), '.freel_agent', 'path');
-const exeOutputPath = path.join(outputDir, 'exe_results.txt');
-const batOutputPath = path.join(outputDir, 'bat_results.txt');
-const lnkOutputPath = path.join(outputDir, 'lnk_results.txt');
-const urlOutputPath = path.join(outputDir, 'url_results.txt');
 const dirOutputPath = path.join(outputDir, 'dir_results.txt');
+const executableOutputPath = path.join(outputDir, 'executable_results.txt');
+const readableOutputPath = path.join(outputDir, 'readable_results.txt');
+const memoryFilePath = path.join(outputDir, 'memory.json');
+
+// 💡 기억 저장소 읽기/쓰기 유틸리티
+const readMemory = (): Record<string, any> => {
+    if (!fs.existsSync(memoryFilePath)) return {};
+    try { return JSON.parse(fs.readFileSync(memoryFilePath, 'utf-8')); }
+    catch { return {}; }
+};
+const writeMemory = (data: Record<string, any>) => {
+    ensureDirectoryExists(outputDir);
+    fs.writeFileSync(memoryFilePath, JSON.stringify(data, null, 2), 'utf-8');
+};
 
 // ==========================================
 // [3] 액션 핸들러 (Action Handlers) 매핑
 // ==========================================
 const ActionHandlers: Record<string, (parameters: any) => Promise<any> | any> = {
   
+  'memory_update': (parameters) => {
+    const { category, key, value } = parameters;
+    const memory = readMemory();
+    
+    if (!memory[category]) memory[category] = {};
+    
+    const existingValue = memory[category][key];
+    
+    if (existingValue) {
+        // 이미 배열인 경우: 중복 확인 후 추가
+        if (Array.isArray(existingValue)) {
+            if (!existingValue.includes(value)) existingValue.push(value);
+        } 
+        // 기존 값이 단일 값(문자열 등)이고 새로운 값과 다른 경우: 배열로 변환
+        else if (existingValue !== value) {
+            memory[category][key] = [existingValue, value];
+        }
+    } else {
+        // 처음 저장되는 값
+        memory[category][key] = value;
+    }
+    
+    writeMemory(memory);
+    return { 
+      message: `[기억 백그라운드 병합 완료] ${category} -> ${key}` 
+    };
+  },
+
+  // 💡 기억 불러오기
+  'memory_retrieve': (parameters) => {
+    const memory = readMemory();
+    const category = parameters.category;
+    
+    if (category) {
+        return memory[category] ? { category, data: memory[category] } : { message: `해당 카테고리(${category})의 기억이 없습니다.` };
+    }
+    return { message: "전체 기억 로드 완료", data: memory };
+  },
+
   'filesystem_list': (parameters) => {
     const targetDir = parameters.path || './';
     return { path: targetDir, files: fs.readdirSync(targetDir) };
@@ -108,9 +176,14 @@ const ActionHandlers: Record<string, (parameters: any) => Promise<any> | any> = 
   },
 
   'system_scan': async (parameters) => { 
-    const maxDepth = parameters.depth || 5;
+    const maxDepth = parameters.depth || 10;
     const blacklistNames = parameters.blacklistNames || [];
-    const blacklistPaths = parameters.blacklistPaths || [];
+    
+    // 💡 1. 절대 지울 수 없는 고정 블랙리스트 경로 배열 생성
+    const fixedBlacklistPaths = ['C:\\Windows', 'C:\\inetpub'];
+    
+    // 💡 2. AI(프론트엔드)가 보낸 블랙리스트와 고정 블랙리스트를 병합
+    const blacklistPaths = [...(parameters.blacklistPaths || []), ...fixedBlacklistPaths];
     
     ensureDirectoryExists(outputDir);
     
@@ -120,57 +193,60 @@ const ActionHandlers: Record<string, (parameters: any) => Promise<any> | any> = 
         console.log(`[Freel-Desktop] 🔍 Auto-detected drives: ${targetPaths.join(', ')}`);
     }
 
-    const combinedResults: ScanResults = { exe: [], bat: [], dir: [], lnk: [], url: [] };
+    const combinedResults: ScanResults = { dir: [], executable: [], readable: [] };
 
-    // 찾은 모든 드라이브를 하나씩 순회하며 스캔 진행
     for (const targetPath of targetPaths) {
         console.log(`[Freel-Desktop] 🔍 Scanning ${targetPath} (Depth: ${maxDepth})...`);
+        // 병합된 blacklistPaths가 scanDirectory 함수로 안전하게 전달됨
         scanDirectory(targetPath, 1, maxDepth, combinedResults, blacklistNames, blacklistPaths);
     }
     
-    // 최종 결과를 캐시에 저장
-    fs.writeFileSync(exeOutputPath, combinedResults.exe.join('\n'), 'utf-8');
-    fs.writeFileSync(batOutputPath, combinedResults.bat.join('\n'), 'utf-8');
     fs.writeFileSync(dirOutputPath, combinedResults.dir.join('\n'), 'utf-8');
-    fs.writeFileSync(lnkOutputPath, combinedResults.lnk.join('\n'), 'utf-8');
-    fs.writeFileSync(urlOutputPath, combinedResults.url.join('\n'), 'utf-8');
+    fs.writeFileSync(executableOutputPath, combinedResults.executable.join('\n'), 'utf-8');
+    fs.writeFileSync(readableOutputPath, combinedResults.readable.join('\n'), 'utf-8');
     
     return { 
-      message: `Scan complete for ${targetPaths.join(', ')}`, 
-      exeSaved: combinedResults.exe.length, 
-      batSaved: combinedResults.bat.length,
+      message: `Scan complete for ${targetPaths.join(', ')} (Depth: ${maxDepth})`, 
       dirSaved: combinedResults.dir.length,
-      lnkSaved: combinedResults.lnk.length,
-      urlSaved: combinedResults.url.length
+      executableSaved: combinedResults.executable.length,
+      readableSaved: combinedResults.readable.length
     };
   },
 
-  'find_application': (parameters) => {
+  // 💡 기존 find_application을 대체하는 실행 파일 검색 도구
+  'find_executable': (parameters) => {
     const keywords = Array.isArray(parameters.keywords) ? parameters.keywords.map((k: string) => k.toLowerCase()) : [String(parameters.keywords).toLowerCase()];
     const matchedPaths: string[] = [];
-    const searchInFile = (filePath: string) => {
-        if (fs.existsSync(filePath)) {
-            const lines = fs.readFileSync(filePath, 'utf-8').split('\n');
-            for (const line of lines) {
-                const cleanPath = line.trim();
-                if (cleanPath && keywords.some((k: string) => path.basename(cleanPath).toLowerCase().includes(k))) {
-                    matchedPaths.push(cleanPath);
-                }
+    
+    if (fs.existsSync(executableOutputPath)) {
+        const lines = fs.readFileSync(executableOutputPath, 'utf-8').split('\n');
+        for (const line of lines) {
+            const cleanPath = line.trim();
+            if (cleanPath && keywords.some((k: string) => path.basename(cleanPath).toLowerCase().includes(k))) {
+                matchedPaths.push(cleanPath);
             }
         }
-    };
-    searchInFile(exeOutputPath);
-    searchInFile(batOutputPath);
-    searchInFile(lnkOutputPath);
-    searchInFile(urlOutputPath);
-
+    }
     matchedPaths.sort((a, b) => a.length - b.length);
+    return { keywords, matchedPaths: matchedPaths.slice(0, 5), totalMatches: matchedPaths.length };
+  },
+
+  // 💡 텍스트/문서 파일을 찾는 도구
+  'find_readable': (parameters) => {
+    const keywords = Array.isArray(parameters.keywords) ? parameters.keywords.map((k: string) => k.toLowerCase()) : [String(parameters.keywords).toLowerCase()];
+    const matchedPaths: string[] = [];
     
-    return { 
-      keywords, 
-      matchedPaths: matchedPaths.slice(0, 5),
-      totalMatches: matchedPaths.length 
-    };
+    if (fs.existsSync(readableOutputPath)) {
+        const lines = fs.readFileSync(readableOutputPath, 'utf-8').split('\n');
+        for (const line of lines) {
+            const cleanPath = line.trim();
+            if (cleanPath && keywords.some((k: string) => path.basename(cleanPath).toLowerCase().includes(k))) {
+                matchedPaths.push(cleanPath);
+            }
+        }
+    }
+    matchedPaths.sort((a, b) => a.length - b.length);
+    return { keywords, matchedPaths: matchedPaths.slice(0, 5), totalMatches: matchedPaths.length };
   },
 
   'find_directory': (parameters) => {
@@ -181,7 +257,6 @@ const ActionHandlers: Record<string, (parameters: any) => Promise<any> | any> = 
         const lines = fs.readFileSync(dirOutputPath, 'utf-8').split('\n');
         for (const line of lines) {
             const cleanPath = line.trim();
-            // 💡 1번 제외 (기존 some 유지: 키워드 중 하나라도 포함되면 결과에 담음)
             if (cleanPath && keywords.some((k: string) => path.basename(cleanPath).toLowerCase().includes(k))) {
                 matchedPaths.push(cleanPath);
             }
@@ -196,6 +271,31 @@ const ActionHandlers: Record<string, (parameters: any) => Promise<any> | any> = 
       matchedPaths: matchedPaths.slice(0, 5),
       // 💡 3번 포함: AI에게 검색된 총 개수 보고
       totalMatches: matchedPaths.length 
+    };
+  },
+
+  'filesystem_read': (parameters) => {
+    if (!fs.existsSync(parameters.path)) {
+      throw new Error(`파일을 찾을 수 없습니다: ${parameters.path}`);
+    }
+    
+    const stat = fs.statSync(parameters.path);
+    if (stat.isDirectory()) {
+      throw new Error(`해당 경로는 폴더입니다. 텍스트 파일의 경로를 입력해주세요: ${parameters.path}`);
+    }
+    
+    // AI 컨텍스트 초과 방지를 위한 안전장치 (예: 2MB 이상의 파일은 거부)
+    const MAX_FILE_SIZE = 2 * 1024 * 1024; 
+    if (stat.size > MAX_FILE_SIZE) {
+      throw new Error(`파일 용량이 너무 커서 읽을 수 없습니다. (최대 2MB 허용)`);
+    }
+
+    const content = fs.readFileSync(parameters.path, 'utf-8');
+    
+    return { 
+      message: `파일 읽기 성공 (${content.length} bytes)`,
+      path: parameters.path, 
+      content: content 
     };
   },
 
